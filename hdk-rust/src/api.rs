@@ -1,3 +1,7 @@
+//! This file contains many of the structs, enums, and functions relevant for Zome
+//! developers! Detailed references and examples can be found here for how to use the
+//! HDK exposed functions to access powerful Holochain functions.
+
 use crate::{
     error::{ZomeApiError, ZomeApiResult},
     globals::*,
@@ -15,10 +19,10 @@ use holochain_wasm_utils::{
             EntryHistory, GetEntryArgs, GetEntryOptions, GetEntryResult, GetEntryResultType,
             StatusRequestKind,
         },
-        get_links::{GetLinksArgs, GetLinksResult},
+        get_links::{GetLinksArgs, GetLinksOptions, GetLinksResult},
         link_entries::LinkEntriesArgs,
         send::SendArgs,
-        QueryArgs, QueryResult, UpdateEntryArgs, ZomeFnCallArgs,
+        QueryArgs, QueryArgsNames, QueryResult, UpdateEntryArgs, ZomeFnCallArgs,
     },
     holochain_core_types::{
         hash::HashString,
@@ -38,10 +42,10 @@ lazy_static! {
   /// The `name` property as taken from the DNA.
   pub static ref DNA_NAME: &'static str = &GLOBALS.dna_name;
 
-  /// The hash of the DNA the Zome is embedded within.
+  /// The address of the DNA the Zome is embedded within.
   /// This is often useful as a fixed value that is known by all
   /// participants running the DNA.
-  pub static ref DNA_HASH: &'static HashString = &GLOBALS.dna_hash;
+  pub static ref DNA_ADDRESS: &'static Address = &GLOBALS.dna_address;
 
   /// The identity string used when the chain was first initialized.
   pub static ref AGENT_ID_STR: &'static str = &GLOBALS.agent_id_str;
@@ -68,9 +72,9 @@ impl From<DNA_NAME> for JsonString {
     }
 }
 
-impl From<DNA_HASH> for JsonString {
-    fn from(dna_hash: DNA_HASH) -> JsonString {
-        JsonString::from(HashString::from(dna_hash.to_string()))
+impl From<DNA_ADDRESS> for JsonString {
+    fn from(dna_address: DNA_ADDRESS) -> JsonString {
+        JsonString::from(HashString::from(dna_address.to_string()))
     }
 }
 
@@ -168,7 +172,7 @@ impl Default for GetEntryMask {
 //    }
 //}
 
-// Allowed input for close_bundle()
+/// Allowed input for close_bundle()
 pub enum BundleOnClose {
     Commit,
     Discard,
@@ -212,7 +216,8 @@ pub fn debug<J: TryInto<JsonString>>(msg: J) -> ZomeApiResult<()> {
     Ok(())
 }
 
-/// Call an exposed function from another zome.
+/// Call an exposed function from another zome or another (bridged) instance running
+/// on the same agent in the same container.
 /// Arguments for the called function are passed as `JsonString`.
 /// Returns the value that's returned by the given function as a json str.
 /// # Examples
@@ -329,7 +334,7 @@ pub fn debug<J: TryInto<JsonString>>(msg: J) -> ZomeApiResult<()> {
 ///         num1: num1,
 ///         num2: num2,
 ///     };
-///     hdk::call("summer", "main", "test_token", "sum", call_input.into())
+///     hdk::call(hdk::THIS_INSTANCE, "summer", "main", "test_token", "sum", call_input.into())
 /// }
 ///
 /// define_zome! {
@@ -353,6 +358,7 @@ pub fn debug<J: TryInto<JsonString>>(msg: J) -> ZomeApiResult<()> {
 /// # }
 /// ```
 pub fn call<S: Into<String>>(
+    instance_handle: S,
     zome_name: S,
     cap_name: S, //temporary...
     cap_token: S,
@@ -368,6 +374,7 @@ pub fn call<S: Into<String>>(
     let allocation_of_input = store_as_json(
         &mut mem_stack,
         ZomeFnCallArgs {
+            instance_handle: instance_handle.into(),
             zome_name: zome_name.into(),
             cap: Some(CapabilityCall::new(
                 cap_name.into(),
@@ -384,16 +391,18 @@ pub fn call<S: Into<String>>(
     unsafe {
         encoded_allocation_of_result = hc_call(allocation_of_input.encode() as u32);
     }
-    // Deserialize complex result stored in memory and check for ERROR in encoding
-    let result = load_string(encoded_allocation_of_result as u32)?;
-
-    // Free result & input allocations.
+    // Deserialize complex result stored in wasm memory
+    let result: ZomeApiInternalResult = load_json(encoded_allocation_of_result as u32)?;
+    // Free result & input allocations
     mem_stack
         .deallocate(allocation_of_input)
         .expect("deallocate failed");
-
     // Done
-    Ok(result.into())
+    if result.ok {
+        Ok(JsonString::from(result.value).try_into()?)
+    } else {
+        Err(ZomeApiError::from(result.error))
+    }
 }
 
 /// Attempts to commit an entry to your local source chain. The entry
@@ -654,7 +663,7 @@ pub fn link_entries<S: Into<String>>(
     }
 }
 
-/// Not Yet Available
+/// NOT YET AVAILABLE
 // Returns a DNA property, which are defined by the DNA developer.
 // They are custom values that are defined in the DNA file
 // that can be used in the zome code for defining configurable behaviors.
@@ -730,12 +739,12 @@ pub fn entry_address(entry: &Entry) -> ZomeApiResult<Address> {
     }
 }
 
-/// Not Yet Available
+/// NOT YET AVAILABLE
 pub fn sign<S: Into<String>>(_doc: S) -> ZomeApiResult<String> {
     Err(ZomeApiError::FunctionNotImplemented)
 }
 
-/// Not Yet Available
+/// NOT YET AVAILABLE
 pub fn verify_signature<S: Into<String>>(
     _signature: S,
     _data: S,
@@ -779,7 +788,7 @@ pub fn update_entry(new_entry: Entry, address: Address) -> ZomeApiResult<Address
     }
 }
 
-/// Not Yet Available
+/// NOT YET AVAILABLE
 pub fn update_agent() -> ZomeApiResult<Address> {
     Err(ZomeApiError::FunctionNotImplemented)
 }
@@ -809,10 +818,13 @@ pub fn remove_entry(address: Address) -> ZomeApiResult<()> {
     res
 }
 
-/// Consumes two values, the first of which is the address of an entry, `base`, and the second of which is a string, `tag`,
-/// used to describe the relationship between the `base` and other entries you wish to lookup. Returns a list of addresses of other
-/// entries which matched as being linked by the given `tag`. Links are created in the first place using the Zome API function [link_entries](fn.link_entries.html).
-/// Once you have the addresses, there is a good likelihood that you will wish to call [get_entry](fn.get_entry.html) for each of them.
+/// Consumes three values, the address of an entry get get links from (the base); the tag of the links
+/// to be retrieved, and an options struct for selecting what meta data, and crud staus links to retrieve.
+/// Note: the tag is intended to describe the relationship between the `base` and other entries you wish to lookup.
+/// This function returns a list of addresses of other entries which matched as being linked by the given `tag`.
+/// Links are created using the Zome API function [link_entries](fn.link_entries.html).
+/// If you also need the content of the entry consider using one of the helper functions:
+/// [get_links_result](fn.get_links_result) or [get_links_and_load](fn._get_links_and_load)
 /// # Examples
 /// ```rust
 /// # extern crate hdk;
@@ -821,15 +833,19 @@ pub fn remove_entry(address: Address) -> ZomeApiResult<()> {
 /// # use holochain_core_types::json::JsonString;
 /// # use holochain_core_types::cas::content::Address;
 /// # use hdk::error::ZomeApiResult;
-/// # use holochain_wasm_utils::api_serialization::get_links::GetLinksResult;
+/// # use holochain_wasm_utils::api_serialization::get_links::{GetLinksResult, GetLinksOptions};
 ///
 /// # fn main() {
 /// pub fn handle_posts_by_agent(agent: Address) -> ZomeApiResult<GetLinksResult> {
-///     hdk::get_links(&agent, "authored_posts")
+///     hdk::get_links_with_options(&agent, "authored_posts", GetLinksOptions::default())
 /// }
 /// # }
 /// ```
-pub fn get_links<S: Into<String>>(base: &Address, tag: S) -> ZomeApiResult<GetLinksResult> {
+pub fn get_links_with_options<S: Into<String>>(
+    base: &Address,
+    tag: S,
+    options: GetLinksOptions,
+) -> ZomeApiResult<GetLinksResult> {
     let mut mem_stack = unsafe { G_MEM_STACK.unwrap() };
     // Put args in struct and serialize into memory
 
@@ -838,6 +854,7 @@ pub fn get_links<S: Into<String>>(base: &Address, tag: S) -> ZomeApiResult<GetLi
         GetLinksArgs {
             entry_address: base.clone(),
             tag: tag.into(),
+            options: options,
         },
     )?;
 
@@ -860,8 +877,74 @@ pub fn get_links<S: Into<String>>(base: &Address, tag: S) -> ZomeApiResult<GetLi
     }
 }
 
+/// Helper function for get_links. Returns a vector with the default return results.
+pub fn get_links<S: Into<String>>(base: &Address, tag: S) -> ZomeApiResult<GetLinksResult> {
+    get_links_with_options(base, tag, GetLinksOptions::default())
+}
+
+/// Retrieves data about entries linked to a base address with a given tag. This is the most general version of the various get_links
+/// helpers (such as get_links_and_load) and can return the linked addresses, entries, headers and sources. Also supports CRUD status_request.
+/// The data returned is configurable with the GetLinksOptions to specify links options and GetEntryOptions argument wto specify options when loading the entries.
+/// # Examples
+/// ```rust
+/// # extern crate hdk;
+/// # extern crate holochain_core_types;
+/// # extern crate holochain_wasm_utils;
+/// # use hdk::error::ZomeApiResult;
+/// # use holochain_core_types::cas::content::Address;
+/// # use holochain_wasm_utils::api_serialization::{
+/// #    get_entry::{GetEntryOptions, GetEntryResult},
+/// #    get_links::GetLinksOptions};
+///
+/// # fn main() {
+/// fn hangle_get_links_result(address: Address) -> ZomeApiResult<Vec<ZomeApiResult<GetEntryResult>>> {
+///    hdk::get_links_result(&address, "test-tag", GetLinksOptions::default(), GetEntryOptions::default())
+/// }
+/// # }
+/// ```
+pub fn get_links_result<S: Into<String>>(
+    base: &Address,
+    tag: S,
+    options: GetLinksOptions,
+    get_entry_options: GetEntryOptions,
+) -> ZomeApiResult<Vec<ZomeApiResult<GetEntryResult>>> {
+    let get_links_result = get_links_with_options(base, tag, options)?;
+    let result = get_links_result
+        .addresses()
+        .iter()
+        .map(|address| get_entry_result(address.to_owned(), get_entry_options.clone()))
+        .collect();
+    Ok(result)
+}
+
+/// Helper function for get_links. Returns a vector of the entries themselves
+pub fn get_links_and_load<S: Into<String>>(
+    base: &HashString,
+    tag: S,
+) -> ZomeApiResult<Vec<ZomeApiResult<Entry>>> {
+    let get_links_result = get_links_result(
+        base,
+        tag,
+        GetLinksOptions::default(),
+        GetEntryOptions::default(),
+    )?;
+
+    let entries = get_links_result
+    .into_iter()
+    .map(|get_result| {
+        let get_type = get_result?.result;
+        match get_type {
+            GetEntryResultType::Single(elem) => Ok(elem.entry.unwrap().to_owned()),
+            GetEntryResultType::All(_) => Err(ZomeApiError::Internal("Invalid response. get_links_result returned all entries when latest was requested".to_string()))
+        }
+    })
+    .collect();
+
+    Ok(entries)
+}
+
 /// Returns a list of entries from your local source chain, that match a given type.
-/// entry_type_name: Specify type of entry to retrieve
+/// entry_type_names: Specify type of entry(s) to retrieve, as a Vec<String> of 0 or more names.
 /// limit: Max number of entries to retrieve
 /// # Examples
 /// ```rust
@@ -873,18 +956,22 @@ pub fn get_links<S: Into<String>>(base: &Address, tag: S) -> ZomeApiResult<GetLi
 ///
 /// # fn main() {
 /// pub fn handle_my_posts_as_commited() -> ZomeApiResult<Vec<Address>> {
-///     hdk::query("post", 0, 0)
+///     hdk::query("post".into(), 0, 0)
 /// }
 /// # }
 /// ```
-pub fn query(entry_type_name: &str, start: u32, limit: u32) -> ZomeApiResult<QueryResult> {
+pub fn query(
+    entry_type_names: QueryArgsNames,
+    start: u32,
+    limit: u32,
+) -> ZomeApiResult<QueryResult> {
     let mut mem_stack: SinglePageStack = unsafe { G_MEM_STACK.unwrap() };
 
     // Put args in struct and serialize into memory
     let allocation_of_input = store_as_json(
         &mut mem_stack,
         QueryArgs {
-            entry_type_name: entry_type_name.to_string(),
+            entry_type_names,
             start,
             limit,
         },
@@ -998,12 +1085,12 @@ pub fn send(to_agent: Address, payload: String) -> ZomeApiResult<String> {
     }
 }
 
-/// Not Yet Available
+/// NOT YET AVAILABLE
 pub fn start_bundle(_timeout: usize, _user_param: serde_json::Value) -> ZomeApiResult<()> {
     Err(ZomeApiError::FunctionNotImplemented)
 }
 
-/// Not Yet Available
+/// NOT YET AVAILABLE
 pub fn close_bundle(_action: BundleOnClose) -> ZomeApiResult<()> {
     Err(ZomeApiError::FunctionNotImplemented)
 }
@@ -1012,6 +1099,7 @@ pub fn close_bundle(_action: BundleOnClose) -> ZomeApiResult<()> {
 // Helpers
 //--------------------------------------------------------------------------------------------------
 
+#[doc(hidden)]
 pub fn check_for_ribosome_error(encoded_allocation: u32) -> ZomeApiResult<()> {
     // Check for error from Ribosome
     let rib_result = decode_encoded_allocation(encoded_allocation);

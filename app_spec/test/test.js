@@ -1,12 +1,46 @@
-const test = require('tape');
-const Container = require('../../nodejs_container');
-const { pollFor } = require('./util');
+const test = require('tape')
+const { pollFor } = require('./util')
 
-const app = Container.instanceFromNameAndDna("bob", "dist/app_spec.hcpkg")
-app.start()
+const { ConfigBuilder, Container } = require('../../nodejs_container')
 
-const app2 = Container.instanceFromNameAndDna("alice", "dist/app_spec.hcpkg")
-app2.start()
+const dnaPath = "./dist/app_spec.hcpkg"
+
+// IIFE to keep config-only stuff out of test scope
+const config = (() => {
+  const agentAlice = ConfigBuilder.agent("alice")
+  const agentBob = ConfigBuilder.agent("bob")
+
+  const dna = ConfigBuilder.dna(dnaPath)
+
+  const instanceAlice = ConfigBuilder.instance(agentAlice, dna)
+  const instanceBob = ConfigBuilder.instance(agentBob, dna)
+
+  return ConfigBuilder.container(instanceAlice, instanceBob)
+})()
+
+// Initialize the Container
+const container = new Container(config)
+container.start()
+
+// This function is a bit of temporary boilerplate to construct a convenient object
+// for testing. These objects will be created automatically with the new Scenario API,
+// and then this function will go away. (TODO)
+const makeCaller = (agentId) => {
+  const instanceId = agentId + '-' + dnaPath
+  return {
+    call: (zome, cap, fn, params) => container.call(instanceId, zome, cap, fn, params),
+    agentId: container.agent_id(instanceId)
+  }
+}
+
+const app = makeCaller('alice')
+const app2 = makeCaller('bob')
+
+test('agentId', (t) => {
+  t.plan(2)
+  t.ok(app.agentId)
+  t.notEqual(app.agentId, app2.agentId)
+})
 
 test('call', (t) => {
   t.plan(1)
@@ -16,7 +50,7 @@ test('call', (t) => {
   const params = { num1, num2 }
   const result = app.call("blog", "main", "check_sum", params)
 
-  t.equal(result.Ok.value, JSON.stringify({ "sum": "4" }))
+  t.deepEqual(result.Ok, { "sum": "4" })
 })
 
 test('hash_post', (t) => {
@@ -91,7 +125,6 @@ test('create_post with bad reply to', (t) => {
   // bad in_reply_to is an error condition
   t.ok(result.Err)
   t.notOk(result.Ok)
-
   const error = JSON.parse(result.Err.Internal)
   t.deepEqual(error.kind, { ErrorGeneric: "Base for link not found" })
   t.ok(error.file)
